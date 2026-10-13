@@ -1,0 +1,363 @@
+#include "image.hpp"
+
+ARGBImage::~ARGBImage() {
+    delete[] data;
+}
+
+ARGBImage::ARGBImage( XImage* image, glm::ivec2 iloc, glm::ivec4 selectionrect, int channels, X11* x11 ) {
+    this->imagex = iloc.x;
+    this->imagey = iloc.y;
+    this->channels = channels;
+    glm::ivec2 spos = glm::ivec2( selectionrect.x, selectionrect.y );
+    offset = spos-iloc;
+    long long int alpha_mask = ~(image->red_mask|image->green_mask|image->blue_mask);
+    long long int roffset = get_shift(image->red_mask);
+    long long int goffset = get_shift(image->green_mask);
+    long long int boffset = get_shift(image->blue_mask);
+    long long int aoffset = get_shift(alpha_mask);
+    width = selectionrect.z;
+    height = selectionrect.w;
+    data = new unsigned char[width*height*channels];
+    // Clear necessary stuff
+    // Top rect
+    for ( int y = 0; y < glm::min(-offset.y,(int)height);y++ ) {
+        for ( int x = 0; x < width;x++ ) {
+            for ( int c = 0; c < channels;c++ ) {
+                data[(y*width+x)*channels+c] = 0;
+            }
+        }
+    }
+    // Left rect
+    for ( int y = 0; y < height;y++ ) {
+        for ( int x = 0; x < glm::min(-offset.x,(int)width);x++ ) {
+            for ( int c = 0; c < channels;c++ ) {
+                data[(y*width+x)*channels+c] = 0;
+            }
+        }
+    }
+    // Bot rect
+    for ( int y=-offset.y+image->height; y<height; y++ ) {
+        for ( int x = 0; x < width;x++ ) {
+            for ( int c = 0; c < channels;c++ ) {
+                data[(y*width+x)*channels+c] = 0;
+            }
+        }
+    }
+    // Right rect
+    for ( int y = 0; y < height;y++ ) {
+        for ( int x = -offset.x+image->width; x<width; x++ ) {
+            for ( int c = 0; c < channels;c++ ) {
+                data[(y*width+x)*channels+c] = 0;
+            }
+        }
+    }
+
+    // Find the intersection of the rectangles.
+    int maxx = glm::max( offset.x, 0 );
+    int maxy = glm::max( offset.y, 0 );
+    int minw = glm::min( (int)(offset.x+width), image->width);
+    int minh = glm::min( (int)(offset.y+height), image->height );
+
+    // Loop only through the intersecting parts, copying everything.
+    // Also check if we have any useful alpha data.
+    switch( channels ) {
+        case 4:
+            if ( aoffset >= image->depth ) {
+                for(int y = maxy; y < minh; y++) {
+                    for(int x = maxx; x < minw; x++) {
+                        // This is where we just have RGB but require an RGBA image.
+                        computeRGBAPixel( data, image, x, y, roffset, goffset, boffset, width, offset );
+                    }
+                }
+            } else {
+                for(int y = maxy; y < minh; y++) {
+                    for(int x = maxx; x < minw; x++) {
+                        computeRGBAPixel( data, image, x, y, roffset, goffset, boffset, aoffset, width, offset );
+                    }
+                }
+            }
+            break;
+        case 3:
+            for(int y = maxy; y < minh; y++) {
+                for(int x = maxx; x < minw; x++) {
+                    computeRGBPixel( data, image, x, y, roffset, goffset, boffset, width, offset );
+                }
+            }
+            break;
+        default:
+            throw new std::invalid_argument("Invalid number of channels provided to image.");
+    }
+}
+
+void png_write_ostream(png_structp png_ptr, png_bytep data, png_size_t length)
+{
+    std::ostream *stream = (std::ostream*)png_get_io_ptr(png_ptr); //Get pointer to ostream
+    stream->write((char*)data,length); //Write requested amount of data
+}
+
+void png_flush_ostream(png_structp png_ptr)
+{
+    std::ostream *stream = (std::ostream*)png_get_io_ptr(png_ptr); //Get pointer to ostream
+    stream->flush();
+}
+
+void user_error_fn(png_structp png_ptr, png_const_charp error_msg)
+{
+    throw new std::runtime_error(error_msg);
+}
+
+void user_warning_fn(png_structp png_ptr, png_const_charp warning_msg)
+{
+    std::cerr << warning_msg << "\n";
+}
+
+void ARGBImage::writePNG( std::ostream& streamout, int quality ) {
+    if ( quality > 10 || quality < 1 ) {
+        throw new std::invalid_argument("Quality argument must be between 1 and 10");
+    }
+    png_structp png = NULL;
+    png_infop info = NULL;
+    png_bytep *rows = new png_bytep[height];
+
+    png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if(!png) throw new std::runtime_error( "Failed to write png image" );
+    info = png_create_info_struct(png);
+    if(!info) throw new std::runtime_error( "Failed to write png image" );
+    png_set_error_fn(png, png_get_error_ptr(png), user_error_fn, user_warning_fn);
+    png_set_write_fn(png, &streamout, png_write_ostream, png_flush_ostream);
+    png_set_compression_level(png, quality-1);
+    if ( channels == 4 ) {
+        png_set_IHDR(png, info, width, height,
+           8, PNG_COLOR_TYPE_RGB_ALPHA, PNG_INTERLACE_NONE,
+           PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    } else {
+        png_set_IHDR(png, info, width, height,
+           8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+           PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    }
+    for( int i=0;i<height;i++ ) {
+        rows[i] = (png_bytep)(data+(i*width*4));
+    }
+    png_write_info(png, info);
+    png_write_image(png, rows);
+    png_write_end(png, info);
+    png_destroy_write_struct(&png, &info);
+}
+
+void ARGBImage::writeJPEG( std::ostream& streamout, int quality ) {
+    if ( channels != 3 ) {
+        throw new std::runtime_error( "JPEG tried to save image with more than 3 channels." );
+    }
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr       jerr;
+ 
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+ 
+    unsigned char* out_buffer = NULL;
+    unsigned long  out_size   = 0;
+    jpeg_mem_dest(&cinfo, &out_buffer, &out_size);
+ 
+    cinfo.image_width      = width;
+    cinfo.image_height     = height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space   = JCS_RGB;
+ 
+    jpeg_set_defaults(&cinfo);
+    // Convert quality from scale 1-10 to 0-100
+    jpeg_set_quality (&cinfo, (int)((float)quality-1.f)*(100.f/9.f), TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+ 
+    JSAMPROW row_pointer;
+    unsigned char* buffer    = (unsigned char*)data;
+ 
+    /* main code to write jpeg data */
+    while (cinfo.next_scanline < cinfo.image_height) {         
+        row_pointer = (JSAMPROW) &buffer[cinfo.next_scanline * 3*width];
+        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+ 
+    streamout.write( (const char*)out_buffer, out_size );
+    free( out_buffer );
+    jpeg_destroy_compress( &cinfo );
+}
+
+void ARGBImage::writeBMP( std::ostream& streamout ) {
+    int padding = (4 - (width * channels % 4)) % 4;
+    int rowSize = width * channels + padding;
+    int imageSize = height * rowSize;
+    int fileSize = 54 + imageSize;
+
+    unsigned char header [14] = {
+        'B', 'M',
+        (unsigned char)fileSize, (unsigned char)(fileSize >> 8),
+        (unsigned char)(fileSize >> 16), (unsigned char)(fileSize >> 24),
+        // Reserved
+        0, 0, 0, 0,
+        // Offset to start of image data
+        54, 0, 0, 0,
+    };
+
+    unsigned char infoHeader [40] = {
+        // Size of header
+        40, 0, 0, 0,
+        (unsigned char)width, (unsigned char)(width >> 8),
+        (unsigned char)(width >> 16), (unsigned char)(width >> 24),
+        (unsigned char)height, (unsigned char)(height >> 8),
+        (unsigned char)(height >> 16), (unsigned char)(height >> 24),
+        // 1 Colour plane
+        1, 0,
+        // 8 bits per channel
+        (unsigned char)(8 * channels), 0,
+        // No compression
+        0, 0, 0, 0,
+        // Size of image including padding
+        (unsigned char)imageSize, (unsigned char)(imageSize >> 8),
+        (unsigned char)(imageSize >> 16), (unsigned char)(imageSize >> 24),
+        // 72 DPI for printing as pixels/metre
+        0x13, 0x0B, 0, 0,
+        0x13, 0x0B, 0, 0,
+        // 0 Palette colours, 0 important colours
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+    };
+
+    streamout.write( (const char*)header, 14 );
+    streamout.write( (const char*)infoHeader, 40 );
+
+    unsigned char* imageData = new unsigned char[imageSize];
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            // BMP is bottom to top and uses BGR/BGRA
+            int outOffset = y*rowSize + x*channels;
+            int inOffset = ((height-y-1)*width + x)*channels;
+            imageData[outOffset] = data[inOffset + 2];
+            imageData[outOffset + 1] = data[inOffset + 1];
+            imageData[outOffset + 2] = data[inOffset];
+            if (channels == 4) {
+              imageData[outOffset + 3] = data[inOffset+3];
+            }
+        }
+
+        for (int p = 0; p < padding; p++) {
+            imageData[y*rowSize + width*channels + p] = 0;
+        }
+    }
+
+    streamout.write( (const char*)imageData, imageSize );
+    delete[] imageData;
+}
+
+void ARGBImage::writeWEBP( std::ostream& streamout, int quality ) {
+    // assume 4 channels
+    if (channels != 4) {
+        throw new std::runtime_error("WebP tried to save image with more than 4 channels");
+    }
+
+    size_t size;
+    uint8_t* out;
+    if (quality == 10) {
+        // encode lossless at highest quality
+        size = WebPEncodeLosslessRGBA(data, width, height, width * 4, &out);
+    }
+    else {
+        // otherwise, encode lossy
+        size = WebPEncodeRGBA(data, width, height, width * 4, quality * 10.0f, &out);
+    }
+
+    if (size == 0) {
+        throw new std::runtime_error("Failed to encode webp image");
+    }
+    else {
+        streamout.write((const char*)out, size);
+        WebPFree(out);
+    }
+}
+
+bool ARGBImage::intersect( XRRCrtcInfo* a, glm::vec4 b ) {
+    if (a->x < b.x + b.z &&
+        a->x + a->width > b.x &&
+        a->y < b.y + b.w &&
+        a->height + a->y > b.y) {
+        return true;
+    }
+    return false;
+}
+
+bool ARGBImage::containsCompletely( XRRCrtcInfo* a, glm::vec4 b ) {
+    if ( b.x >= a->x && b.y >= a->y && b.x+b.z <= a->x+a->width && b.y+b.w <= a->y+a->height ) {
+        return true;
+    }
+    return false;
+}
+
+void ARGBImage::mask(X11* x11) {
+    if ( !x11->haveXRR ) {
+        return;
+    }
+    std::vector<XRRCrtcInfo*> physicalMonitors = x11->getCRTCS();
+    // Make sure a masking needs to happen, it's not a perfect detection,
+    // but will detect most situations where a masking actually needs to happen.
+    for ( int i=0;i<physicalMonitors.size();i++ ) {
+        XRRCrtcInfo* m = physicalMonitors[i];
+        if ( intersect(m, glm::vec4(imagex, imagey, width, height ) ) ) {
+            if ( containsCompletely(m, glm::vec4( imagex, imagey, width, height ) ) ) {
+                x11->freeCRTCS(physicalMonitors);
+                return;
+            }
+        }
+    }
+    unsigned char* copy = new unsigned char[width*height*channels];
+    // Zero out our copy
+    memset( copy, 0, width*height*channels );
+
+    for ( int i=0;i<physicalMonitors.size();i++ ) {
+        // Make sure we're intersecting
+        XRRCrtcInfo* m = physicalMonitors[i];
+        if ( !intersect(m, glm::vec4(imagex, imagey, width, height ) ) ) {
+            continue;
+        }
+        // Copy over data within the intersecting areas.
+        for ( int y = glm::max(0,m->y-imagey); y<glm::min(height,m->y+m->height-imagey);y++ ) {
+            int start = (y*width + glm::max(0, m->x-imagex))*channels;
+            int end = (y*width + glm::min(width,m->x+m->width-imagex))*channels;
+            memcpy( copy+start, data+start, end-start );
+        }
+    }
+    x11->freeCRTCS(physicalMonitors);
+    delete[] data;
+    data = copy;
+}
+
+void ARGBImage::blendCursor( X11* x11 ) {
+    if ( !x11->haveXFixes ) {
+        return;
+    }
+    XFixesCursorImage* xcursor = XFixesGetCursorImage( x11->display );
+    if ( !xcursor ) {
+        return;
+    }
+    // 64bit -> 32bit conversion
+    unsigned char pixels[xcursor->width * xcursor->height * 4];
+    for ( unsigned int i=0;i<xcursor->width*xcursor->height;i++ ) {
+        ((unsigned int*)pixels)[ i ] = (unsigned int)xcursor->pixels[ i ];
+    }
+    xcursor->y -= xcursor->yhot + offset.x;
+    xcursor->x -= xcursor->xhot + offset.y;
+    for ( int y = glm::max(0,xcursor->y-imagey); y<glm::min((int)height,xcursor->y+xcursor->height-imagey);y++ ) {
+        for ( int x = glm::max(0,xcursor->x-imagex); x < glm::min((int)width,xcursor->x+xcursor->width-imagex);x++ ) {
+            int cx = x-(xcursor->x-imagex);
+            int cy = y-(xcursor->y-imagey);
+            float alpha = (float)pixels[(cy*xcursor->width+cx)*4+3]/255.f;
+            data[(y*width+x)*channels] = data[(y*width+x)*channels]*(1-alpha) + pixels[(cy*xcursor->width+cx)*4+2]*alpha;
+            data[(y*width+x)*channels+1] = data[(y*width+x)*channels+1]*(1-alpha) + pixels[(cy*xcursor->width+cx)*4+1]*alpha;
+            data[(y*width+x)*channels+2] = data[(y*width+x)*channels+2]*(1-alpha) + pixels[(cy*xcursor->width+cx)*4]*alpha;
+            // If the original image has alpha, we need to override it.
+            if ( channels == 4 ) {
+                data[(y*width+x)*channels+3] = glm::min(data[(y*width+x)*channels+3]+pixels[(cy*xcursor->width+cx)*4+3],255);
+            }
+        }
+    }
+}
